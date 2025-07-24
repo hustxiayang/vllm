@@ -41,9 +41,8 @@ from transformers import PreTrainedTokenizerBase
 
 from backend_request_func import (
     ASYNC_REQUEST_FUNCS,
-    OPENAI_COMPATIBLE_BACKENDS,
+    EmbeddingRequestFuncOutput,
     RequestFuncInput,
-    RequestFuncOutput,
 )
 
 try:
@@ -82,22 +81,15 @@ MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 class BenchmarkMetrics:
     completed: int
     total_input: int
-    total_output: int
     request_throughput: float
     request_goodput: float
-    output_throughput: float
     total_token_throughput: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
     percentiles_ttft_ms: list[tuple[float, float]]
-    mean_tpot_ms: float
-    median_tpot_ms: float
     std_tpot_ms: float
     percentiles_tpot_ms: list[tuple[float, float]]
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
     percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
@@ -110,7 +102,7 @@ class BenchmarkMetrics:
 
 def calculate_metrics(
     input_requests: list[SampleRequest],
-    outputs: list[RequestFuncOutput],
+    outputs: list[EmbeddingRequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     selected_percentile_metrics: list[str],
@@ -161,16 +153,6 @@ def calculate_metrics(
         valid_metrics = []
         slo_values = []
 
-        if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
-            slo_values.append(
-                goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION
-            )
-        if "tpot" in goodput_config_dict:
-            valid_metrics.append(all_tpots)
-            slo_values.append(
-                goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION
-            )
         if "e2el" in goodput_config_dict:
             valid_metrics.append(e2els)
             slo_values.append(
@@ -393,7 +375,7 @@ async def benchmark(
         )
         task = limited_request_func(request_func_input=request_func_input, pbar=pbar)
         tasks.append(asyncio.create_task(task))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[EmbeddingRequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
         print("Stopping profiler...")
@@ -603,7 +585,6 @@ def main(args: argparse.Namespace):
     model_name = args.served_model_name
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
-    request_id_prefix = args.request_id_prefix if args.request_id_prefix is not None else ""
 
     # Validate ramp-up arguments
     if args.ramp_up_strategy is not None:
@@ -768,31 +749,6 @@ def main(args: argparse.Namespace):
             raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
     goodput_config_dict = check_goodput_args(args)
 
-    # Collect the sampling parameters.
-    sampling_params = {
-        k: v
-        for k, v in {
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "min_p": args.min_p,
-            "temperature": args.temperature,
-        }.items()
-        if v is not None
-    }
-
-    # Sampling parameters are only supported by openai-compatible backend.
-    if sampling_params and args.backend not in OPENAI_COMPATIBLE_BACKENDS:
-        raise ValueError(
-            "Sampling parameters are only supported by openai-compatible backends."
-        )
-
-    if "temperature" not in sampling_params:
-        sampling_params["temperature"] = 0.0  # Default to greedy decoding.
-
-    if args.backend == "llama.cpp":
-        # Disable prompt caching in llama.cpp backend
-        sampling_params["cache_prompt"] = False
-
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
     gc.freeze()
@@ -817,7 +773,6 @@ def main(args: argparse.Namespace):
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
-            extra_body=sampling_params,
             ramp_up_strategy=args.ramp_up_strategy,
             ramp_up_start_rps=args.ramp_up_start_rps,
             ramp_up_end_rps=args.ramp_up_end_rps,
@@ -971,24 +926,11 @@ def create_argument_parser():
         type=str,
         help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
     )
-    parser.add_argument("--use-beam-search", action="store_true")
     parser.add_argument(
         "--num-prompts",
         type=int,
         default=1000,
         help="Number of prompts to process.",
-    )
-    parser.add_argument(
-        "--logprobs",
-        type=int,
-        default=None,
-        help=(
-            "Number of logprobs-per-token to compute & return as part of "
-            "the request. If unspecified, then either (1) if beam search "
-            "is disabled, no logprobs are computed & a single dummy "
-            "logprob is returned for each token; or (2) if beam search "
-            "is enabled 1 logprob per token is computed"
-        ),
     )
     parser.add_argument(
         "--request-rate",
@@ -1104,13 +1046,6 @@ def create_argument_parser():
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve",
     )
-    parser.add_argument(
-        "--request-id-prefix",
-        type=str,
-        required=False,
-        default="benchmakr-serving",
-        help='Specify the prefix of request id.',
-    )
 
     # group for dataset specific arguments
     custom_group = parser.add_argument_group("custom dataset options")
@@ -1124,35 +1059,6 @@ def create_argument_parser():
         "--custom-skip-chat-template",
         action="store_true",
         help="Skip applying chat template to prompt, used only for custom dataset.",
-    )
-
-    sonnet_group = parser.add_argument_group("sonnet dataset options")
-    sonnet_group.add_argument(
-        "--sonnet-input-len",
-        type=int,
-        default=550,
-        help="Number of input tokens per request, used only for sonnet dataset.",
-    )
-    sonnet_group.add_argument(
-        "--sonnet-output-len",
-        type=int,
-        default=150,
-        help="Number of output tokens per request, used only for sonnet dataset.",
-    )
-    sonnet_group.add_argument(
-        "--sonnet-prefix-len",
-        type=int,
-        default=200,
-        help="Number of prefix tokens per request, used only for sonnet dataset.",
-    )
-
-    sharegpt_group = parser.add_argument_group("sharegpt dataset options")
-    sharegpt_group.add_argument(
-        "--sharegpt-output-len",
-        type=int,
-        default=None,
-        help="Output length for each request. Overrides the output length "
-        "from the ShareGPT dataset.",
     )
 
     random_group = parser.add_argument_group("random dataset options")

@@ -34,6 +34,7 @@ class RequestFuncInput:
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
     language: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 @dataclass
@@ -71,6 +72,9 @@ async def async_request_tgi(
             "inputs": request_func_input.prompt,
             "parameters": params,
         }
+        if request_func_input.request_id:
+            headers = ({"x-request-id": request_func_input.request_id},)
+
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         if request_func_input.ignore_eos:
@@ -82,7 +86,9 @@ async def async_request_tgi(
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(url=api_url, json=payload) as response:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -145,6 +151,8 @@ async def async_request_trt_llm(
         }
         if request_func_input.ignore_eos:
             payload["min_length"] = request_func_input.output_len
+        if request_func_input.request_id:
+            headers = ({"x-request-id": request_func_input.request_id},)
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
 
@@ -152,7 +160,9 @@ async def async_request_trt_llm(
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(url=api_url, json=payload) as response:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -211,6 +221,8 @@ async def async_request_deepspeed_mii(
             "top_p": 1.0,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        if request_func_input.request_id:
+            headers["x-request-id"] = (request_func_input.request_id,)
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -283,6 +295,8 @@ async def async_request_openai_completions(
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        if request_func_input.request_id:
+            headers["x-request-id"] = (request_func_input.request_id,)
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -374,7 +388,7 @@ async def async_request_openai_chat_completions(
             ],
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
-            "stream": True,
+            "stream": True,  # can not test non-stream payloads?
             "stream_options": {
                 "include_usage": True,
             },
@@ -387,6 +401,8 @@ async def async_request_openai_chat_completions(
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         }
+        if request_func_input.request_id:
+            headers["x-request-id"] = (request_func_input.request_id,)
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -483,6 +499,8 @@ async def async_request_openai_audio(
         headers = {
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         }
+        if request_func_input.request_id:
+            headers["x-request-id"] = (request_func_input.request_id,)
 
         # Send audio file
         def to_bytes(y, sr):
@@ -619,6 +637,12 @@ ASYNC_REQUEST_FUNCS = {
     "scalellm": async_request_openai_completions,
     "sglang": async_request_openai_completions,
     "llama.cpp": async_request_openai_completions,
+}
+
+# update this
+ASYNC_EMBEDDING_REQUEST_FUNCS = {
+    "vllm": async_request_openai_completions,
+    "openai": async_request_openai_completions,
 }
 
 OPENAI_COMPATIBLE_BACKENDS = [
