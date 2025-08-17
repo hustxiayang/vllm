@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 # MLA Common Components
 
@@ -233,8 +234,7 @@ except ImportError:
         flash_attn_varlen_func = None
 
 if TYPE_CHECKING:
-    from vllm.worker.model_runner import (ModelInputForGPUBuilder,
-                                          ModelInputForGPUWithSamplingMetadata)
+    from vllm.worker.model_runner import ModelInputForGPUBuilder
 
 is_hip = current_platform.is_rocm()
 
@@ -630,90 +630,6 @@ class MLACommonMetadata(AttentionMetadata):
             is_profile_run=self.is_profile_run)
         return self._cached_decode_metadata
 
-    def advance_step(self,
-                     model_input: "ModelInputForGPUWithSamplingMetadata",
-                     sampled_token_ids: Optional[torch.Tensor],
-                     block_size: int,
-                     num_seqs: int,
-                     num_queries: int,
-                     turn_prefills_into_decodes: bool = False):
-        """
-        Update metadata in-place to advance one decode step.
-        """
-        # When using cudagraph, the num_seqs is padded to the next captured
-        # batch sized, but num_queries tracks the actual number of requests in
-        # the batch. For --enforce-eager mode, num_seqs == num_queries
-        if num_seqs != num_queries:
-            assert num_seqs > num_queries
-
-        if turn_prefills_into_decodes:
-            # When Multi-Step is enabled with Chunked-Prefill, prefills and
-            # decodes are scheduled together. In the first step, all the
-            # prefills turn into decodes. This update reflects that
-            # conversion.
-            assert self.num_decode_tokens + self.num_prefills == num_seqs
-            self.num_decode_tokens += self.num_prefills
-            self.num_prefills = 0
-            self.num_prefill_tokens = 0
-            self.max_prefill_seq_len = 0
-            self.max_query_len = 1
-
-            self.slot_mapping = self.slot_mapping[:num_seqs]
-        else:
-            assert self.seq_lens is not None
-            assert self.max_decode_seq_len == max(self.seq_lens)
-
-        assert self.num_prefills == 0
-        assert self.num_prefill_tokens == 0
-        assert self.num_decode_tokens == num_seqs
-        assert self.slot_mapping.shape == (num_seqs, )
-
-        assert self.seq_lens is not None
-        assert len(self.seq_lens) == num_seqs
-        assert self.seq_lens_tensor is not None
-        assert self.seq_lens_tensor.shape == (num_seqs, )
-        assert self.max_query_len == 1
-        assert self.max_prefill_seq_len == 0
-
-        assert self.query_start_loc is not None
-        assert self.query_start_loc.shape == (num_queries + 1, )
-        assert self.seq_start_loc is not None
-        assert self.seq_start_loc.shape == (num_seqs + 1, )
-
-        assert self.context_lens_tensor is not None
-        assert self.context_lens_tensor.shape == (num_queries, )
-
-        assert self.block_tables is not None
-        assert self.block_tables.shape[0] == num_seqs
-
-        # Update query lengths. Note that we update only queries and not seqs,
-        # since tensors may be padded due to captured cuda graph batch size
-        for i in range(num_queries):
-            self.seq_lens[i] += 1
-        self.max_decode_seq_len = max(self.seq_lens)
-
-        self._ops_advance_step(num_seqs=num_seqs,
-                               num_queries=num_queries,
-                               block_size=block_size,
-                               input_tokens=model_input.input_tokens,
-                               sampled_token_ids=sampled_token_ids,
-                               input_positions=model_input.input_positions)
-
-    def _ops_advance_step(self, num_seqs: int, num_queries: int,
-                          block_size: int, input_tokens: torch.Tensor,
-                          sampled_token_ids: torch.Tensor,
-                          input_positions: torch.Tensor) -> None:
-        # here we use advance_step_flashinfo to update the paged_kv_* tensors
-        ops.advance_step_flashattn(num_seqs=num_seqs,
-                                   num_queries=num_queries,
-                                   block_size=block_size,
-                                   input_tokens=input_tokens,
-                                   sampled_token_ids=sampled_token_ids,
-                                   input_positions=input_positions,
-                                   seq_lens=self.seq_lens_tensor,
-                                   slot_mapping=self.slot_mapping,
-                                   block_tables=self.block_tables)
-
 
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[T], Generic[T]):
     """
@@ -996,9 +912,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]],
         logits_soft_cap: Optional[float],
         attn_type: str,
+        kv_sharing_target_layer_name: Optional[str],
         # MLA Specific Arguments
         q_lora_rank: Optional[int],
         kv_lora_rank: int,
@@ -1008,6 +924,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         v_head_dim: int,
         kv_b_proj: ColumnParallelLinear,
     ) -> None:
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing not supported in V0.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1092,10 +1010,6 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         rest = None
         if isinstance(attn_out, tuple):
             attn_out, *rest = attn_out
-
-        # unpad if necessary
-        if self._pad_v:
-            attn_out = attn_out[..., :v.shape[-1]]
 
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
@@ -1294,6 +1208,10 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 suffix_lse=suffix_lse,
             )
 
+        # unpad if necessary
+        if self._pad_v:
+            output = output[..., :v.shape[-1]]
+
         return output.flatten(start_dim=-2)
 
     @abstractmethod
@@ -1315,10 +1233,16 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         kv_cache: torch.Tensor,
         attn_metadata: T,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if output is not None:
             raise NotImplementedError(
                 "output is not yet supported for MLAImplBase")
+
+        if output_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported"
+                " for MLAImplBase")
 
         if attn_metadata.is_profile_run and \
             attn_metadata.context_chunk_workspace is not None:

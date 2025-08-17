@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Based on:
 Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., & Krishnamurthy, A. (2023).
@@ -7,11 +8,11 @@ https://arxiv.org/abs/2310.18547
 """
 
 import torch
-import triton
-import triton.language as tl
 
 from vllm.lora.ops.triton_ops.kernel_utils import do_expand_kernel
 from vllm.lora.ops.triton_ops.utils import _get_lora_b_ptr
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
 
 
@@ -153,7 +154,7 @@ def _lora_expand(
         lora_token_start_loc (torch.Tensor): A cumulative sum of
             num_tokens_per_lora. lora_token_start_loc[0] is always 0 so that
             lora_token_start_loc[i], along with num_tokens_per_lora[i]
-            identifies the the region in token_indices_sorted_by_lora_ids that
+            identifies the region in token_indices_sorted_by_lora_ids that
             LoRA lora_ids[i] should process.
         lora_ids (torch.Tensor): LoRA ids to process.
         no_lora_flag_cpu (torch.Tensor): A CPU tensor of size 1, that indicates
@@ -282,6 +283,7 @@ try:
         op_func=_lora_expand,
         mutates_args=["output_tensor"],
         fake_impl=_lora_expand_fake,
+        dispatch_key=current_platform.dispatch_key,
     )
     lora_expand = torch.ops.vllm.lora_expand
 

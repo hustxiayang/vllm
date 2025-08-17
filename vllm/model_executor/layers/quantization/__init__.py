@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Literal, get_args
 
@@ -6,7 +7,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 
 QuantizationMethods = Literal[
-    "aqlm",
     "awq",
     "deepspeedfp",
     "tpu_int8",
@@ -14,7 +14,7 @@ QuantizationMethods = Literal[
     "ptpc_fp8",
     "fbgemm_fp8",
     "modelopt",
-    "nvfp4",
+    "modelopt_fp4",
     "marlin",
     "bitblas",
     "gguf",
@@ -33,6 +33,10 @@ QuantizationMethods = Literal[
     "quark",
     "moe_wna16",
     "torchao",
+    "auto-round",
+    "rtn",
+    "inc",
+    "mxfp4",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -83,7 +87,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
-    from .aqlm import AQLMConfig
+    from .auto_round import AutoRoundConfig
     from .awq import AWQConfig
     from .awq_marlin import AWQMarlinConfig
     from .bitblas import BitBLASConfig
@@ -100,25 +104,27 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .gptq_marlin import GPTQMarlinConfig
     from .gptq_marlin_24 import GPTQMarlin24Config
     from .hqq_marlin import HQQMarlinConfig
+    from .inc import INCConfig
     from .ipex_quant import IPEXConfig
     from .marlin import MarlinConfig
     from .modelopt import ModelOptFp8Config, ModelOptNvFp4Config
     from .moe_wna16 import MoeWNA16Config
+    from .mxfp4 import Mxfp4Config
     from .neuron_quant import NeuronQuantConfig
     from .ptpc_fp8 import PTPCFp8Config
     from .qqq import QQQConfig
+    from .rtn import RTNConfig
     from .torchao import TorchAOConfig
     from .tpu_int8 import Int8TpuConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
-        "aqlm": AQLMConfig,
         "awq": AWQConfig,
         "deepspeedfp": DeepSpeedFPConfig,
         "tpu_int8": Int8TpuConfig,
         "fp8": Fp8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
         "modelopt": ModelOptFp8Config,
-        "nvfp4": ModelOptNvFp4Config,
+        "modelopt_fp4": ModelOptNvFp4Config,
         "marlin": MarlinConfig,
         "bitblas": BitBLASConfig,
         "gguf": GGUFConfig,
@@ -138,6 +144,10 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "quark": QuarkConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
+        "auto-round": AutoRoundConfig,
+        "rtn": RTNConfig,
+        "inc": INCConfig,
+        "mxfp4": Mxfp4Config,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

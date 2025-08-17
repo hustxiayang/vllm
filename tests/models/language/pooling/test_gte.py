@@ -1,71 +1,81 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
 import pytest
 
-from ...utils import EmbedModelInfo, run_embedding_correctness_test
+from ...utils import (CLSPoolingEmbedModelInfo, CLSPoolingRerankModelInfo,
+                      EmbedModelInfo, LASTPoolingEmbedModelInfo,
+                      RerankModelInfo, check_transformers_version)
+from .embed_utils import correctness_test_embed_models
+from .mteb_utils import mteb_test_embed_models, mteb_test_rerank_models
 
 MODELS = [
     ########## BertModel
-    EmbedModelInfo("thenlper/gte-large",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=True),
-    EmbedModelInfo("thenlper/gte-base",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=False),
-    EmbedModelInfo("thenlper/gte-small",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=False),
-    EmbedModelInfo("thenlper/gte-large-zh",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=False),
-    EmbedModelInfo("thenlper/gte-base-zh",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=False),
-    EmbedModelInfo("thenlper/gte-small-zh",
-                   architecture="BertModel",
-                   dtype="float32",
-                   enable_test=False),
+    CLSPoolingEmbedModelInfo("thenlper/gte-large",
+                             architecture="BertModel",
+                             enable_test=True),
+    CLSPoolingEmbedModelInfo("thenlper/gte-base",
+                             architecture="BertModel",
+                             enable_test=False),
+    CLSPoolingEmbedModelInfo("thenlper/gte-small",
+                             architecture="BertModel",
+                             enable_test=False),
+    CLSPoolingEmbedModelInfo("thenlper/gte-large-zh",
+                             architecture="BertModel",
+                             enable_test=False),
+    CLSPoolingEmbedModelInfo("thenlper/gte-base-zh",
+                             architecture="BertModel",
+                             enable_test=False),
+    CLSPoolingEmbedModelInfo("thenlper/gte-small-zh",
+                             architecture="BertModel",
+                             enable_test=False),
     ########### NewModel
-    EmbedModelInfo("Alibaba-NLP/gte-multilingual-base",
-                   architecture="GteNewModel",
-                   enable_test=True),
-    EmbedModelInfo("Alibaba-NLP/gte-base-en-v1.5",
-                   architecture="GteNewModel",
-                   enable_test=True),
-    EmbedModelInfo("Alibaba-NLP/gte-large-en-v1.5",
-                   architecture="GteNewModel",
-                   enable_test=True),
+    CLSPoolingEmbedModelInfo("Alibaba-NLP/gte-multilingual-base",
+                             architecture="GteNewModel",
+                             enable_test=True),
+    CLSPoolingEmbedModelInfo("Alibaba-NLP/gte-base-en-v1.5",
+                             architecture="GteNewModel",
+                             enable_test=True),
+    CLSPoolingEmbedModelInfo("Alibaba-NLP/gte-large-en-v1.5",
+                             architecture="GteNewModel",
+                             enable_test=True),
     ########### Qwen2ForCausalLM
-    EmbedModelInfo("Alibaba-NLP/gte-Qwen2-1.5B-instruct",
-                   architecture="Qwen2ForCausalLM",
-                   enable_test=True),
-    EmbedModelInfo("Alibaba-NLP/gte-Qwen2-7B-instruct",
-                   architecture="Qwen2ForCausalLM",
-                   enable_test=False),
+    LASTPoolingEmbedModelInfo("Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+                              architecture="Qwen2ForCausalLM",
+                              enable_test=True),
     ########## ModernBertModel
-    EmbedModelInfo("Alibaba-NLP/gte-modernbert-base",
-                   architecture="ModernBertModel",
-                   enable_test=True),
+    CLSPoolingEmbedModelInfo("Alibaba-NLP/gte-modernbert-base",
+                             architecture="ModernBertModel",
+                             enable_test=True),
+    ########## Qwen3ForCausalLM
+    LASTPoolingEmbedModelInfo("Qwen/Qwen3-Embedding-0.6B",
+                              architecture="Qwen3ForCausalLM",
+                              dtype="float32",
+                              enable_test=True),
+    LASTPoolingEmbedModelInfo("Qwen/Qwen3-Embedding-4B",
+                              architecture="Qwen3ForCausalLM",
+                              dtype="float32",
+                              enable_test=False),
+]
+
+RERANK_MODELS = [
+    # classifier_pooling: mean
+    CLSPoolingRerankModelInfo(
+        "Alibaba-NLP/gte-reranker-modernbert-base",
+        architecture="ModernBertForSequenceClassification",
+        enable_test=True),
 ]
 
 
 @pytest.mark.parametrize("model_info", MODELS)
-def test_models_mteb(hf_runner, vllm_runner,
-                     model_info: EmbedModelInfo) -> None:
-    pytest.skip("Skipping mteb test.")
-
-    from .mteb_utils import mteb_test_embed_models
+def test_embed_models_mteb(hf_runner, vllm_runner,
+                           model_info: EmbedModelInfo) -> None:
+    if model_info.name == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
+        check_transformers_version(model_info.name,
+                                   max_transformers_version="4.53.2")
 
     vllm_extra_kwargs: dict[str, Any] = {}
-    if model_info.name == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
-        vllm_extra_kwargs["hf_overrides"] = {"is_causal": True}
-
     if model_info.architecture == "GteNewModel":
         vllm_extra_kwargs["hf_overrides"] = {"architectures": ["GteNewModel"]}
 
@@ -74,31 +84,22 @@ def test_models_mteb(hf_runner, vllm_runner,
 
 
 @pytest.mark.parametrize("model_info", MODELS)
-def test_models_correctness(hf_runner, vllm_runner, model_info: EmbedModelInfo,
-                            example_prompts) -> None:
-    if not model_info.enable_test:
-        pytest.skip("Skipping test.")
-
-    # ST will strip the input texts, see test_embedding.py
-    example_prompts = [str(s).strip() for s in example_prompts]
+def test_embed_models_correctness(hf_runner, vllm_runner,
+                                  model_info: EmbedModelInfo,
+                                  example_prompts) -> None:
+    if model_info.name == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
+        check_transformers_version(model_info.name,
+                                   max_transformers_version="4.53.2")
 
     vllm_extra_kwargs: dict[str, Any] = {}
-    if model_info.name == "Alibaba-NLP/gte-Qwen2-1.5B-instruct":
-        vllm_extra_kwargs["hf_overrides"] = {"is_causal": True}
-
     if model_info.architecture == "GteNewModel":
         vllm_extra_kwargs["hf_overrides"] = {"architectures": ["GteNewModel"]}
 
-    with vllm_runner(model_info.name,
-                     task="embed",
-                     dtype=model_info.dtype,
-                     max_model_len=None,
-                     **vllm_extra_kwargs) as vllm_model:
-        vllm_outputs = vllm_model.encode(example_prompts)
+    correctness_test_embed_models(hf_runner, vllm_runner, model_info,
+                                  example_prompts, vllm_extra_kwargs)
 
-    with hf_runner(
-            model_info.name,
-            dtype=model_info.dtype,
-            is_sentence_transformer=True,
-    ) as hf_model:
-        run_embedding_correctness_test(hf_model, example_prompts, vllm_outputs)
+
+@pytest.mark.parametrize("model_info", RERANK_MODELS)
+def test_rerank_models_mteb(hf_runner, vllm_runner,
+                            model_info: RerankModelInfo) -> None:
+    mteb_test_rerank_models(hf_runner, vllm_runner, model_info)

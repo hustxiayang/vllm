@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Any, Optional
 
 import torch
+from packaging import version
 
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
@@ -14,7 +16,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 from vllm.platforms import current_platform
 
-MIN_IPEX_VERSION = "2.5.0"
+MIN_IPEX_VERSION = "2.6.0"
 
 
 class IPEXConfig(QuantizationConfig):
@@ -134,7 +136,8 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
 
         try:
             import intel_extension_for_pytorch as ipex
-            if ipex.__version__ < MIN_IPEX_VERSION:
+            if version.parse(
+                    ipex.__version__) < version.parse(MIN_IPEX_VERSION):
                 raise ImportError(
                     "intel_extension_for_pytorch version is "
                     "wrong. Please install "
@@ -181,8 +184,6 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
         out = layer.ipex_qlinear(reshaped_x)
-        if bias is not None:
-            out.add_(bias)
         return out.reshape(x.shape[:-1] + (layer.ipex_output_size, ))
 
 
@@ -200,7 +201,8 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
 
         try:
             import intel_extension_for_pytorch as ipex
-            if ipex.__version__ < MIN_IPEX_VERSION:
+            if version.parse(
+                    ipex.__version__) < version.parse(MIN_IPEX_VERSION):
                 raise ImportError(
                     "intel_extension_for_pytorch version is "
                     "wrong. Please install "

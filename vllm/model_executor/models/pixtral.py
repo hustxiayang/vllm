@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -9,7 +10,9 @@ from typing import Literal, Optional, TypedDict, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mistral_common.protocol.instruct.messages import ImageChunk
+from mistral_common.protocol.instruct.messages import (ImageChunk, TextChunk,
+                                                       UserMessage)
+from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from transformers import PixtralVisionConfig, TensorType
@@ -39,7 +42,8 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, MultiModalHashes,
                                         PromptReplacement, PromptUpdate,
                                         PromptUpdateDetails)
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import (MistralTokenizer,
                                                cached_tokenizer_from_config)
@@ -51,7 +55,12 @@ from .vision import VisionEncoderInfo, resolve_visual_encoder_outputs
 
 try:
     from xformers import ops as xops
-    USE_XFORMERS_OPS = True
+    if (current_platform.is_cuda()
+            and current_platform.has_device_capability(100)):
+        # Xformers FA is not compatible with B200
+        USE_XFORMERS_OPS = False
+    else:
+        USE_XFORMERS_OPS = True
 except ImportError:
     USE_XFORMERS_OPS = False
 
@@ -65,14 +74,14 @@ class PixtralImagePixelInputs(TypedDict):
     """
     Shape: `(batch_size * num_images, num_channels, image_width, image_height)`
 
-    The result of stacking {attr}`ImageEncoding.tokens` from each prompt.
+    The result of stacking `ImageEncoding.tokens` from each prompt.
     """
 
 
 class PixtralProcessorAdapter:
     """
     Provide a HF-compatible interface for
-    {class}`mistral_common.tokens.tokenizers.multimodal.ImageEncoder`.
+    `mistral_common.tokens.tokenizers.multimodal.ImageEncoder`.
     """
 
     def __init__(self, tokenizer: MistralTokenizer) -> None:
@@ -224,6 +233,31 @@ class PixtralDummyInputsBuilder(BaseDummyInputsBuilder[PixtralProcessingInfo]):
                                    num_images=num_images)
         }
 
+    def get_dummy_processor_inputs(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> ProcessorInputs:
+        tokenizer = self.info.get_tokenizer()
+
+        dummy_text = self.get_dummy_text(mm_counts)
+        dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts)
+        dummy_images = dummy_mm_data.get("image", [])
+        tokenization_kwargs = {"truncation": False}
+
+        request = ChatCompletionRequest(messages=[
+            UserMessage(content=[
+                TextChunk(text=dummy_text),
+                *(ImageChunk(image=image) for image in dummy_images),
+            ]),
+        ])
+        res = tokenizer.mistral.encode_chat_completion(request)
+        dummy_tokens = res.tokens
+
+        return ProcessorInputs(prompt=dummy_tokens,
+                               mm_data=dummy_mm_data,
+                               tokenization_kwargs=tokenization_kwargs)
+
 
 class PixtralMultiModalProcessor(BaseMultiModalProcessor[PixtralProcessingInfo]
                                  ):
@@ -272,14 +306,20 @@ class PixtralMultiModalProcessor(BaseMultiModalProcessor[PixtralProcessingInfo]
         prompt: Union[str, list[int]],
         mm_data_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
         *,
         return_mm_hashes: bool,
     ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashes], bool]:
-        prompt_ids, mm_kwargs, mm_hashes, _ = super(
-        )._cached_apply_hf_processor(
+        (
+            prompt_ids,
+            mm_kwargs,
+            mm_hashes,
+            _,
+        ) = super()._cached_apply_hf_processor(
             prompt=prompt,
             mm_data_items=mm_data_items,
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
             return_mm_hashes=return_mm_hashes,
         )
 
@@ -292,6 +332,13 @@ class PixtralMultiModalProcessor(BaseMultiModalProcessor[PixtralProcessingInfo]
                                         dummy_inputs=PixtralDummyInputsBuilder)
 class PixtralForConditionalGeneration(nn.Module, SupportsMultiModal,
                                       SupportsPP):
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        if modality.startswith("image"):
+            return None
+
+        raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -380,11 +427,11 @@ class PixtralForConditionalGeneration(nn.Module, SupportsMultiModal,
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
-    def get_multimodal_embeddings(
-            self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
+    def get_multimodal_embeddings(self,
+                                  **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
-            return None
+            return []
 
         return self._process_image_input(image_input)
 
@@ -394,7 +441,8 @@ class PixtralForConditionalGeneration(nn.Module, SupportsMultiModal,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is not None:
+        if multimodal_embeddings is not None \
+            and len(multimodal_embeddings) != 0:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
                 inputs_embeds,
@@ -623,7 +671,19 @@ class Attention(nn.Module):
         v = v.reshape(batch, patches, self.n_heads, self.head_dim)
 
         q, k = apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
-        out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
+
+        if USE_XFORMERS_OPS:
+            out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = nn.functional.scaled_dot_product_attention(q,
+                                                             k,
+                                                             v,
+                                                             attn_mask=mask)
+            out = out.transpose(1, 2)
+
         out = out.reshape(batch, patches, self.n_heads * self.head_dim)
         return self.wo(out)
 
@@ -766,8 +826,11 @@ class VisionTransformer(nn.Module):
             mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
                 [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], )
         else:
-            raise ImportError("Xformers is required for Pixtral inference "
-                              "with the Mistral format")
+            from transformers.models.pixtral.modeling_pixtral import (
+                generate_block_attention_mask)
+            mask = generate_block_attention_mask(
+                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list],
+                patch_embeds)
         out = self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
 
         # squeeze dim 0 and split into separate tensors for each image
@@ -1040,7 +1103,6 @@ class PixtralHFAttention(nn.Module):
             # Transpose q and k back for attention
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
-
             out = xops.memory_efficient_attention(q,
                                                   k,
                                                   v,

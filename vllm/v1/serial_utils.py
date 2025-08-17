@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import importlib
 import pickle
 from collections.abc import Sequence
 from inspect import isclass
@@ -8,6 +10,7 @@ from types import FunctionType
 from typing import Any, Optional, Union
 
 import cloudpickle
+import msgspec
 import numpy as np
 import torch
 import zmq
@@ -21,6 +24,7 @@ from vllm.multimodal.inputs import (BaseMultiModalField,
                                     MultiModalFlatField, MultiModalKwargs,
                                     MultiModalKwargsItem,
                                     MultiModalSharedField, NestedTensors)
+from vllm.v1.engine import UtilityResult
 
 logger = init_logger(__name__)
 
@@ -43,6 +47,13 @@ bytestr = Union[bytes, bytearray, memoryview, zmq.Frame]
 def _log_insecure_serialization_warning():
     logger.warning_once("Allowing insecure serialization using pickle due to "
                         "VLLM_ALLOW_INSECURE_SERIALIZATION=1")
+
+
+def _typestr(val: Any) -> Optional[tuple[str, str]]:
+    if val is None:
+        return None
+    t = type(val)
+    return t.__module__, t.__qualname__
 
 
 class MsgpackEncoder:
@@ -102,24 +113,26 @@ class MsgpackEncoder:
                 int(v) if v is not None else None
                 for v in (obj.start, obj.stop, obj.step))
 
-        if isinstance(obj, MultiModalKwargs):
-            mm: MultiModalKwargs = obj
-            if not mm.modalities:
-                # just return the main dict if there are no modalities.
-                return dict(mm)
+        if isinstance(obj, MultiModalKwargsItem):
+            return self._encode_mm_item(obj)
 
-            # ignore the main dict, it will be re-indexed.
-            # Encode a list of MultiModalKwargsItems as plain dicts
-            # + special handling for .field.
-            # Any tensors *not* indexed by modality will be ignored.
-            return [[{
-                "modality": elem.modality,
-                "key": elem.key,
-                "data": self._encode_nested_tensors(elem.data),
-                "field": self._encode_mm_field(elem.field),
-            } for elem in item.values()]
-                    for itemlist in mm._items_by_modality.values()
-                    for item in itemlist]
+        if isinstance(obj, MultiModalKwargs):
+            return [
+                self._encode_mm_item(item)
+                for itemlist in obj._items_by_modality.values()
+                for item in itemlist
+            ]
+
+        if isinstance(obj, UtilityResult):
+            result = obj.result
+            if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+                return None, result
+            # Since utility results are not strongly typed, we also encode
+            # the type (or a list of types in the case it's a list) to
+            # help with correct msgspec deserialization.
+            return _typestr(result) if type(result) is not list else [
+                _typestr(v) for v in result
+            ], result
 
         if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
             raise TypeError(f"Object of type {type(obj)} is not serializable"
@@ -139,7 +152,7 @@ class MsgpackEncoder:
     ) -> tuple[str, tuple[int, ...], Union[int, memoryview]]:
         assert self.aux_buffers is not None
         # If the array is non-contiguous, we need to copy it first
-        arr_data = obj.data if obj.data.c_contiguous else obj.tobytes()
+        arr_data = obj.data if obj.flags.c_contiguous else obj.tobytes()
         if not obj.shape or obj.nbytes < self.size_threshold:
             # Encode small arrays and scalars inline. Using this extension type
             # ensures we can avoid copying when decoding.
@@ -158,10 +171,8 @@ class MsgpackEncoder:
         self, obj: torch.Tensor
     ) -> tuple[str, tuple[int, ...], Union[int, memoryview]]:
         assert self.aux_buffers is not None
-        # this creates a copy of the tensor if it's not already contiguous
-        obj = obj.contiguous()
-        #  view the tensor as a 1D array of bytes
-        arr = obj.view((obj.numel(), )).view(torch.uint8).numpy()
+        # view the tensor as a contiguous 1D array of bytes
+        arr = obj.flatten().contiguous().view(torch.uint8).numpy()
         if obj.nbytes < self.size_threshold:
             # Smaller tensors are encoded inline, just like ndarrays.
             data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr.data)
@@ -169,8 +180,25 @@ class MsgpackEncoder:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
             self.aux_buffers.append(arr.data)
-        dtype = str(obj.dtype)[6:]  # remove 'torch.' prefix
+        dtype = str(obj.dtype).removeprefix("torch.")
         return dtype, obj.shape, data
+
+    def _encode_mm_item(self,
+                        item: MultiModalKwargsItem) -> list[dict[str, Any]]:
+        return [self._encode_mm_field_elem(elem) for elem in item.values()]
+
+    def _encode_mm_field_elem(self,
+                              elem: MultiModalFieldElem) -> dict[str, Any]:
+        return {
+            "modality":
+            elem.modality,
+            "key":
+            elem.key,
+            "data": (None if elem.data is None else
+                     self._encode_nested_tensors(elem.data)),
+            "field":
+            self._encode_mm_field(elem.field),
+        }
 
     def _encode_nested_tensors(self, nt: NestedTensors) -> Any:
         if isinstance(nt, torch.Tensor):
@@ -230,22 +258,45 @@ class MsgpackDecoder:
                 return self._decode_tensor(obj)
             if t is slice:
                 return slice(*obj)
+            if issubclass(t, MultiModalKwargsItem):
+                return self._decode_mm_item(obj)
             if issubclass(t, MultiModalKwargs):
-                if isinstance(obj, list):
-                    return MultiModalKwargs.from_items(
-                        self._decode_mm_items(obj))
-                return MultiModalKwargs({
-                    k: self._decode_nested_tensors(v)
-                    for k, v in obj.items()
-                })
+                return MultiModalKwargs(self._decode_mm_items(obj))
+            if t is UtilityResult:
+                return self._decode_utility_result(obj)
         return obj
+
+    def _decode_utility_result(self, obj: Any) -> UtilityResult:
+        result_type, result = obj
+        if result_type is not None:
+            if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+                raise TypeError("VLLM_ALLOW_INSECURE_SERIALIZATION must "
+                                "be set to use custom utility result types")
+            assert isinstance(result_type, list)
+            if len(result_type) == 2 and isinstance(result_type[0], str):
+                result = self._convert_result(result_type, result)
+            else:
+                assert isinstance(result, list)
+                result = [
+                    self._convert_result(rt, r)
+                    for rt, r in zip(result_type, result)
+                ]
+        return UtilityResult(result)
+
+    def _convert_result(self, result_type: Sequence[str], result: Any) -> Any:
+        if result_type is None:
+            return result
+        mod_name, name = result_type
+        mod = importlib.import_module(mod_name)
+        result_type = getattr(mod, name)
+        return msgspec.convert(result, result_type, dec_hook=self.dec_hook)
 
     def _decode_ndarray(self, arr: Any) -> np.ndarray:
         dtype, shape, data = arr
         # zero-copy decode. We assume the ndarray will not be kept around,
         # as it now locks the whole received message buffer in memory.
         buffer = self.aux_buffers[data] if isinstance(data, int) else data
-        return np.ndarray(buffer=buffer, dtype=np.dtype(dtype), shape=shape)
+        return np.frombuffer(buffer, dtype=dtype).reshape(shape)
 
     def _decode_tensor(self, arr: Any) -> torch.Tensor:
         dtype, shape, data = arr
@@ -254,33 +305,39 @@ class MsgpackDecoder:
         # not complain about a readonly memoryview.
         buffer = self.aux_buffers[data] if isinstance(data, int) \
             else bytearray(data)
-        # Create numpy wrapper around the bytes
-        arr = np.ndarray(buffer=buffer, dtype=np.uint8, shape=(len(buffer), ))
         torch_dtype = getattr(torch, dtype)
         assert isinstance(torch_dtype, torch.dtype)
+        if not buffer:  # torch.frombuffer doesn't like empty buffers
+            assert 0 in shape
+            return torch.empty(shape, dtype=torch_dtype)
+        # Create uint8 array
+        arr = torch.frombuffer(buffer, dtype=torch.uint8)
         # Convert back to proper shape & type
-        return torch.from_numpy(arr).view(torch_dtype).view(shape)
+        return arr.view(torch_dtype).view(shape)
 
-    def _decode_mm_items(self, obj: list) -> list[MultiModalKwargsItem]:
-        decoded_items = []
-        for item in obj:
-            elems = []
-            for v in item:
-                v["data"] = self._decode_nested_tensors(v["data"])
-                # Reconstruct the field processor using MultiModalFieldConfig
-                factory_meth_name, *field_args = v["field"]
-                factory_meth = getattr(MultiModalFieldConfig,
-                                       factory_meth_name)
+    def _decode_mm_items(self, obj: list[Any]) -> list[MultiModalKwargsItem]:
+        return [self._decode_mm_item(v) for v in obj]
 
-                # Special case: decode the union "slices" field of
-                # MultiModalFlatField
-                if factory_meth_name == "flat":
-                    field_args[0] = self._decode_nested_slices(field_args[0])
+    def _decode_mm_item(self, obj: list[Any]) -> MultiModalKwargsItem:
+        return MultiModalKwargsItem.from_elems(
+            [self._decode_mm_field_elem(v) for v in obj])
 
-                v["field"] = factory_meth(None, *field_args).field
-                elems.append(MultiModalFieldElem(**v))
-            decoded_items.append(MultiModalKwargsItem.from_elems(elems))
-        return decoded_items
+    def _decode_mm_field_elem(self, obj: dict[str,
+                                              Any]) -> MultiModalFieldElem:
+        if obj["data"] is not None:
+            obj["data"] = self._decode_nested_tensors(obj["data"])
+
+        # Reconstruct the field processor using MultiModalFieldConfig
+        factory_meth_name, *field_args = obj["field"]
+        factory_meth = getattr(MultiModalFieldConfig, factory_meth_name)
+
+        # Special case: decode the union "slices" field of
+        # MultiModalFlatField
+        if factory_meth_name == "flat":
+            field_args[0] = self._decode_nested_slices(field_args[0])
+
+        obj["field"] = factory_meth(None, *field_args).field
+        return MultiModalFieldElem(**obj)
 
     def _decode_nested_tensors(self, obj: Any) -> NestedTensors:
         if isinstance(obj, (int, float)):
