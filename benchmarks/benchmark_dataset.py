@@ -1171,3 +1171,100 @@ class ASRDataset(HuggingFaceDataset):
             )
         self.maybe_oversample_requests(sampled_requests, num_requests)
         return sampled_requests
+
+
+@dataclass
+class EmbeddingSampleRequest:
+    """
+    Represents a single embedding request for benchmarking.
+    """
+
+    prompt: Union[str, Any]
+    prompt_len: int
+
+
+# -----------------------------------------------------------------------------
+# Random Dataset Implementation for Embeddings (Synthetic Data)
+# -----------------------------------------------------------------------------
+
+
+class EmbeddingRandomDataset(BenchmarkDataset):
+    # Default values copied from benchmark_serving.py for the random dataset.
+    # TODO: do not need this in this version
+    # DEFAULT_PREFIX_LEN = 0
+    # DEFAULT_RANGE_RATIO = 0.0
+    # DEFAULT_INPUT_LEN = 1024
+    # DEFAULT_OUTPUT_LEN = 128
+
+    def __init__(
+        self,
+        length,
+        count,
+        distribution,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        """Generate random prompts of specified length."""
+
+        self.prompt_len = length
+        # Generate prompt lengths according to the specified distribution
+        prompt_lengths = self.gen_random_num(length, count, distribution)
+
+        # Create prompts by repeating "hello " the specified number of times for each length
+        self.prompts = [
+            "hello " * (prompt_length - 4) for prompt_length in prompt_lengths
+        ]
+
+    def gen_random_num(self, param: int, count: int, distribution: str) -> np.ndarray:
+        """Generate random values based on the specified distribution.
+
+        Args:
+            param: The maximum value for the distribution parameter (max length or batch size)
+            count: Number of values to generate
+            distribution: Type of distribution - "uniform", "normal", or "fixed"
+
+        Returns:
+            A single integer if count=1, otherwise a numpy array of integers
+
+        Raises:
+            ValueError: If an invalid distribution is specified
+        """
+        if distribution == "uniform":
+            # Generate values following uniform distribution between 1 and param
+            values = np.random.randint(1, param + 1, count)
+        elif distribution == "normal":
+            # Generate values following normal distribution with mean at param/2
+            # Standard deviation is param/4, clipped to range [1, param]
+            values = np.random.normal(param / 2, param / 4, count)
+            values = np.clip(values, 1, param).astype(int)
+        elif distribution == "fixed":
+            # Generate constant values equal to param
+            values = np.full(count, param)
+        else:
+            raise ValueError(f"Invalid distribution: {distribution}")
+
+        # Return a single value if count=1, otherwise the full array
+        if count == 1:
+            return values[0]
+        return values
+
+    # TODO: double check
+    def sample(
+        self,
+        num_prompts: int,
+        batch_size: int,
+        distribution: str,
+    ) -> list[EmbeddingSampleRequest]:
+        prompt_index = 0
+        input_requests = []
+
+        for _ in range(num_prompts):
+            curr_batch_size = self.gen_random_num(batch_size, 1, distribution)
+            prompt = self.prompts[prompt_index : prompt_index + curr_batch_size]
+            prompt_index += curr_batch_size
+
+            input_requests.append(
+                EmbeddingSampleRequest(prompt=prompt, prompt_len=self.prompt_len)
+            )
+
+        return input_requests

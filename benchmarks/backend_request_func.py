@@ -49,6 +49,24 @@ class RequestFuncOutput:
     error: str = ""
 
 
+@dataclass
+class EmbeddingRequestFuncInput:
+    prompt: str
+    api_url: str
+    prompt_len: int
+    model: str
+    batch_size: int
+    model_name: Optional[str] = None
+
+
+@dataclass
+class EmbeddingRequestFuncOutput:
+    success: bool = False
+    latency: float = 0.0
+    prompt_len: int = 0
+    error: str = ""
+
+
 async def async_request_tgi(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -619,6 +637,66 @@ ASYNC_REQUEST_FUNCS = {
     "scalellm": async_request_openai_completions,
     "sglang": async_request_openai_completions,
     "llama.cpp": async_request_openai_completions,
+}
+
+
+async def async_request_openai_embedding_completions(
+    request_func_input: EmbeddingRequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> EmbeddingRequestFuncOutput:
+    api_url = request_func_input.api_url
+    batch_size = request_func_input.batch_size
+    # update here
+    assert api_url.endswith(("embeddings", "profile")), (
+        "OpenAI Completions API URL must end with 'completions' or 'profile'."
+    )
+
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=AIOHTTP_TIMEOUT
+    ) as session:
+        payload = {
+            "model": request_func_input.model_name
+            if request_func_input.model_name
+            else request_func_input.model,
+            "input": request_func_input.prompt,
+        }
+        headers = {"Content-Type": "application/json"}
+        # headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        print(f"{len(request_func_input.prompt[0])=}")
+        output = EmbeddingRequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        st = time.perf_counter()
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status != 200:
+                    output.error = response.reason or ""
+                    output.success = False
+                else:
+                    result = await response.json()
+
+                    # Check if the response contains the expected data
+                    if "data" not in result or len(result["data"]) != batch_size:
+                        output.error = f"Expected {batch_size} embeddings, got {len(result.get('data', []))}"
+                        output.success = False
+                    else:
+                        output.latency = time.perf_counter() - st
+                        output.success = True
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+ASYNC_EMBEDDING_REQUEST_FUNCS = {
+    "vllm": async_request_openai_embedding_completions,
+    "openai": async_request_openai_embedding_completions,
 }
 
 OPENAI_COMPATIBLE_BACKENDS = [
