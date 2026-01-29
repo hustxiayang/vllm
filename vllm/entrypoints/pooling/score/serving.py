@@ -66,6 +66,28 @@ class ServingScores(OpenAIServing):
 
         self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
 
+    def _truncate_text_to_tokens(
+        self,
+        text: str,
+        tokenizer: TokenizerLike,
+        max_tokens: int,
+    ) -> str:
+        """Truncate text to a maximum number of tokens.
+
+        Args:
+            text: The text to truncate.
+            tokenizer: The tokenizer to use for token counting.
+            max_tokens: Maximum number of tokens to keep.
+
+        Returns:
+            The truncated text, or original text if already within limit.
+        """
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) <= max_tokens:
+            return text
+        truncated_ids = token_ids[:max_tokens]
+        return tokenizer.decode(truncated_ids)
+
     async def _embedding_score(
         self,
         tokenizer: TokenizerLike,
@@ -76,7 +98,22 @@ class ServingScores(OpenAIServing):
         tokenization_kwargs: dict[str, Any] | None = None,
         lora_request: LoRARequest | None | None = None,
         trace_headers: Mapping[str, str] | None = None,
+        max_tokens_per_doc: int | None = None,
     ) -> list[PoolingRequestOutput] | ErrorResponse:
+        # Truncate documents if max_tokens_per_doc is set
+        if max_tokens_per_doc is not None:
+            truncate_async = make_async(
+                self._truncate_text_to_tokens, executor=self._tokenizer_executor
+            )
+            data_2 = list(
+                await asyncio.gather(
+                    *(
+                        truncate_async(doc, tokenizer, max_tokens_per_doc)
+                        for doc in data_2
+                    )
+                )
+            )
+
         input_texts = data_1 + data_2
 
         engine_prompts: list[TokensPrompt] = []
@@ -192,9 +229,24 @@ class ServingScores(OpenAIServing):
         tokenization_kwargs: dict[str, Any] | None = None,
         lora_request: LoRARequest | None | None = None,
         trace_headers: Mapping[str, str] | None = None,
+        max_tokens_per_doc: int | None = None,
     ) -> list[PoolingRequestOutput] | ErrorResponse:
         request_prompts: list[str] = []
         engine_prompts: list[TokensPrompt] = []
+
+        # Truncate documents if max_tokens_per_doc is set (only for text documents)
+        if max_tokens_per_doc is not None and all(isinstance(d, str) for d in data_2):
+            truncate_async = make_async(
+                self._truncate_text_to_tokens, executor=self._tokenizer_executor
+            )
+            data_2 = list(
+                await asyncio.gather(
+                    *(
+                        truncate_async(doc, tokenizer, max_tokens_per_doc)
+                        for doc in data_2
+                    )
+                )
+            )
 
         if len(data_1) == 1:
             data_1 = data_1 * len(data_2)
@@ -289,6 +341,7 @@ class ServingScores(OpenAIServing):
         tokenizer = self.renderer.get_tokenizer()
 
         truncate_prompt_tokens = getattr(request, "truncate_prompt_tokens", None)
+        max_tokens_per_doc = getattr(request, "max_tokens_per_doc", None)
 
         tokenization_kwargs: dict[str, Any] = {}
         _validate_truncation_size(
@@ -330,6 +383,7 @@ class ServingScores(OpenAIServing):
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 trace_headers=trace_headers,
+                max_tokens_per_doc=max_tokens_per_doc,
             )
 
         else:
@@ -342,6 +396,7 @@ class ServingScores(OpenAIServing):
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 trace_headers=trace_headers,
+                max_tokens_per_doc=max_tokens_per_doc,
             )
 
     async def create_score(
@@ -399,6 +454,12 @@ class ServingScores(OpenAIServing):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
+
+        # Validate max_tokens_per_doc
+        if request.max_tokens_per_doc is not None and request.max_tokens_per_doc <= 0:
+            return self.create_error_response(
+                "max_tokens_per_doc must be a positive integer"
+            )
 
         request_id = f"rerank-{self._base_request_id(raw_request)}"
         documents = request.documents
